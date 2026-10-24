@@ -1,0 +1,55 @@
+name: Original storefront package receiving
+# Event-driven qualification of the original signed Checkout/Durable Object owner.
+# No scheduled jobs, Stripe credentials, publication or live webhook requests.
+on:
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: original-storefront-receiving-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  native-receiving:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Resolve actual declared dependency graph without publishing
+        run: npm install --ignore-scripts --no-audit --no-fund --package-lock=false --fetch-retries=0 --fetch-timeout=20000
+      - name: Run original source check and all three mandatory receiving suites
+        run: |
+          npm run check
+          node --test test/stripe-checkout-fulfillment.test.mjs test/durable-fulfillment.test.mjs test/worker-runtime.test.mjs
+      - name: Verify source capability and immutable carrier candidate without publishing
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          const expected = ['test/stripe-checkout-fulfillment.test.mjs', 'test/durable-fulfillment.test.mjs', 'test/worker-runtime.test.mjs'];
+          for (const path of expected) assert.ok(pkg.receivingTests.includes(path), 'missing mandatory receiving: ' + path);
+          assert.equal((await import('./src/worker-runtime.mjs')).SUPPORTS_EXTERNAL_STRIPE_PAYMENT_LINK_AUDIT, true);
+          NODE
+          npm pack --dry-run --json > /tmp/storefront-package-preview.json
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const packs = JSON.parse(readFileSync('/tmp/storefront-package-preview.json', 'utf8'));
+          assert.equal(packs.length, 1);
+          const files = new Set(packs[0].files.map(item => item.path));
+          for (const path of [
+            'src/worker-runtime.mjs', 'src/stripe-checkout-fulfillment.mjs',
+            'src/durable-fulfillment.mjs', 'test/stripe-checkout-fulfillment.test.mjs',
+            'test/durable-fulfillment.test.mjs', 'test/worker-runtime.test.mjs',
+          ]) assert.ok(files.has(path), 'unpacked carrier lacks ' + path);
+          console.log(JSON.stringify({packageName:packs[0].name, declaredVersion:packs[0].version,
+            candidateSha512:packs[0].integrity, containedRequiredFiles:6,
+            publication:'not-attempted', installedByShop:'not-observed'},null,2));
+          NODE

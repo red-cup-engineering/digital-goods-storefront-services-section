@@ -46,18 +46,37 @@ async function receiveExternalCheckout(event,projection,env){
   signatureVerified:true,buyerPersonalDataRecorded:false,rawBodyRecorded:false,
   consequence:'outside-catalog-checkout-observed-not-group-treasury-settlement'
  };
+ const receipt={
+  category:'stripe-webhook-event-admission.events',
+  recordedAt:new Date().toISOString(),
+  record,told:{for:true,against:false}
+ };
+ // Snapshot our intent BEFORE calling an adapter that can mutate its input.
+ // Comparing an ACK against that same mutable input is a circular oracle.
+ const expectedCategory=receipt.category;
+ const expectedRecord=JSON.stringify(receipt.record);
+ const expectedTold=JSON.stringify(receipt.told);
  let persisted;
  try{
-  persisted=await env.audit.record({
-   category:'stripe-webhook-event-admission.events',
-   recordedAt:new Date().toISOString(),
-   record,told:{for:true,against:false}
-  });
+  persisted=await env.audit.record(receipt);
+  // A fulfilled Promise is not a durable receipt. A custom/legacy adapter
+  // can resolve undefined or an unrelated object without writing the event.
+  // Keep Stripe retries possible unless the original audit client returns
+  // its complete, matching admission envelope and explicit disposition.
+  if(!persisted||typeof persisted!=='object'||
+    (persisted.duplicate!==true&&persisted.duplicate!==false)||
+    receipt.category!==expectedCategory||
+    JSON.stringify(receipt.record)!==expectedRecord||
+    JSON.stringify(receipt.told)!==expectedTold||
+    persisted.category!==expectedCategory||
+    JSON.stringify(persisted.record)!==expectedRecord||
+    JSON.stringify(persisted.told)!==expectedTold)
+    throw new TypeError('external-checkout-audit-receipt-missing-or-mismatched');
  }catch{
   return json({error:'external-checkout-audit-unavailable'},503);
  }
  return json({accepted:true,externalCheckoutObserved:true,
-  duplicate:persisted?.duplicate===true,settlement:'not-established'});
+  duplicate:persisted.duplicate,settlement:'not-established'});
 }
 
 function json(value, status = 200) { return Response.json(value, { status, headers: { "cache-control": "no-store" } }); }

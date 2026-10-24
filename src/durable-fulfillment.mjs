@@ -3,7 +3,30 @@ import { reviewCopyEntitlement } from "./review-copy.mjs";
 
 function reply(value, status = 200) { return Response.json(value ?? null, { status }); }
 function sameCheckout(left, right) {
-  return left && left.sessionId === right.sessionId && left.offeringId === right.offeringId && left.requestDigest === right.requestDigest && left.amountTotal === right.amountTotal && left.currency === right.currency && left.stripeMode === right.stripeMode && JSON.stringify(left.goods) === JSON.stringify(right.goods) && left.release === right.release && JSON.stringify(left.admittedRelease ?? null) === JSON.stringify(right.admittedRelease ?? null);
+  return left && left.sessionId === right.sessionId && left.offeringId === right.offeringId && left.requestDigest === right.requestDigest && left.amountTotal === right.amountTotal && left.currency === right.currency && left.stripeMode === right.stripeMode && JSON.stringify(left.goods) === JSON.stringify(right.goods) && left.release === right.release && JSON.stringify(left.admittedRelease ?? null) === JSON.stringify(right.admittedRelease ?? null)
+    // The same Checkout session cannot switch the bound buyer or status on a
+    // retry. Absent and explicit null are equivalent for legacy consumers.
+    && (left.account ?? null) === (right.account ?? null)
+    && (left.status ?? null) === (right.status ?? null);
+}
+// Persist only the immutable, non-PII event facts consumed by Checkout
+// receiving. A Stripe event ID cannot be reinterpreted as another amount,
+// currency, payment intent or state during a retry.
+function paymentClaimFacts(body, eventType) {
+  return {
+    sessionId: body.sessionId, type: eventType,
+    offeringId: body.offeringId, requestDigest: body.requestDigest,
+    amountTotal: body.amountTotal, currency: body.currency,
+    stripeMode: body.stripeMode, paymentStatus: body.paymentStatus,
+    status: body.status, paymentIntentId: body.paymentIntentId ?? null,
+    createdAt: body.createdAt ?? null,
+  };
+}
+function matchesPaymentCheckout(checkout, body) {
+  return !!checkout && body.status === "complete"
+    && checkout.offeringId === body.offeringId && checkout.requestDigest === body.requestDigest
+    && checkout.amountTotal === body.amountTotal && checkout.currency === body.currency
+    && checkout.stripeMode === body.stripeMode;
 }
 const EMAIL = /^[^\s@]+@[^\s@]+$/u;
 const GIFT_ID = /^gift-[0-9a-f-]{36}$/u;
@@ -46,20 +69,53 @@ export class DigitalGoodsFulfillment {
     if (request.method === "POST" && url.pathname === "/claim") return this.ctx.storage.transaction(async (transaction) => {
       const eventType = body.eventType ?? "checkout.session.completed";
       if (!CHECKOUT_EVENTS.includes(eventType)) return reply({ disposition: "rejected" }, 409);
-      if (await transaction.get(`event:${body.eventId}`)) return reply({ disposition: "duplicate" });
+      const claimFacts = paymentClaimFacts(body, eventType);
+      const priorEvent = await transaction.get(`event:${body.eventId}`);
+      if (priorEvent) {
+        if (priorEvent.sessionId !== body.sessionId || priorEvent.type !== eventType)
+          return reply({ disposition: "rejected" }, 409);
+        if (priorEvent.claimFacts !== undefined) {
+          // Complete receipts written by this revision are compared against
+          // their ORIGINAL facts, not mutable Checkout or entitlement state.
+          if (JSON.stringify(priorEvent.claimFacts) !== JSON.stringify(claimFacts))
+            return reply({ disposition: "rejected" }, 409);
+        } else {
+          // Older persisted rows contain only session/type/pending. Do not
+          // invent a full original payload: bound legacy retries to the
+          // immutable Checkout and any already retained payment intent.
+          // Legacy createdAt and other unknown facts remain unverified.
+          const originalCheckout = await transaction.get(`checkout:${body.sessionId}`);
+          if (!matchesPaymentCheckout(originalCheckout, body))
+            return reply({ disposition: "rejected" }, 409);
+          const pending = eventType === "checkout.session.completed" && body.paymentStatus === "unpaid";
+          if ((priorEvent.pending === true) !== pending || (!pending && body.paymentStatus !== "paid"))
+            return reply({ disposition: "rejected" }, 409);
+          if (!pending) {
+            const entitlement = await transaction.get(`entitlement:${body.sessionId}`);
+            if (entitlement?.paymentIntentId != null && entitlement.paymentIntentId !== claimFacts.paymentIntentId)
+              return reply({ disposition: "rejected" }, 409);
+          }
+        }
+        return reply({ disposition: "duplicate" });
+      }
       const checkout = await transaction.get(`checkout:${body.sessionId}`);
-      const matched = checkout && body.status === "complete" && checkout.offeringId === body.offeringId && checkout.requestDigest === body.requestDigest && checkout.amountTotal === body.amountTotal && checkout.currency === body.currency && checkout.stripeMode === body.stripeMode;
+      const matched = matchesPaymentCheckout(checkout, body);
       if (!matched) return reply({ disposition: "rejected" }, 409);
       // Stripe may complete Checkout before an asynchronous method is paid.
       // Retain that original event without manufacturing an entitlement or
       // requiring Stripe to retry a legitimate, still-unpaid completion.
       if (eventType === "checkout.session.completed" && body.paymentStatus === "unpaid") {
-        await transaction.put(`event:${body.eventId}`, { sessionId: body.sessionId, type: eventType, pending: true });
+        await transaction.put(`event:${body.eventId}`, { sessionId: body.sessionId, type: eventType, pending: true, claimFacts });
         return reply({ disposition: "pending" });
       }
       if (body.paymentStatus !== "paid") return reply({ disposition: "rejected" }, 409);
-      await transaction.put(`event:${body.eventId}`, { sessionId: body.sessionId, type: eventType });
       const entitlementKey = `entitlement:${body.sessionId}`; const existing = await transaction.get(entitlementKey);
+      // A second signed event for one Checkout is not another payment.
+      // Compare the original settled payment intent BEFORE recording the new
+      // event ID: an acknowledged mismatch would permanently suppress retries.
+      if (existing && (existing.paymentIntentId ?? null) !== (body.paymentIntentId ?? null))
+        return reply({ disposition: "rejected" }, 409);
+      await transaction.put(`event:${body.eventId}`, { sessionId: body.sessionId, type: eventType, claimFacts });
       if (existing) return reply({ disposition: "duplicate-session" });
       const account = accountOf(checkout.account);
       await transaction.put(entitlementKey, { id: body.sessionId, kind: "purchase", sessionId: body.sessionId, offeringId: checkout.offeringId, goods: checkout.goods, release: checkout.release ?? null, admittedRelease: checkout.admittedRelease ?? null, account, status: "active", paymentIntentId: body.paymentIntentId ?? null, createdAt: body.createdAt ?? null });
@@ -140,7 +196,7 @@ export function createDurableFulfillment(namespace, name) {
     async bindEntitlement(value) { return call("/bind", value); },
     async listAccount(email) { return (await get("account", email)) ?? []; },
     async listGrants(email) { return (await get("grants", email)) ?? []; },
-    audit: { async record(entry) { const result = await call("/audit", entry); if (result.failed||result.ok!==true) throw new Error("could not record checkout receipt"); return {...entry,duplicate:result.duplicate===true}; } },
+    audit: { async record(entry) { const result = await call("/audit", entry); if (result.failed||result.ok!==true||typeof result.duplicate!=="boolean") throw new Error("could not record checkout receipt"); return {...entry,duplicate:result.duplicate}; } },
   };
 }
 
